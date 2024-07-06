@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 import torchvision
 from torchvision import transforms
-
+from transformers import BertTokenizer, BertModel
 
 def set_seed(seed):
     random.seed(seed)
@@ -84,6 +84,7 @@ class VQADataset(torch.utils.data.Dataset):
             words = question.split(" ")
             for word in words:
                 if word not in self.question2idx:
+                    word = process_text(word)
                     self.question2idx[word] = len(self.question2idx)
         self.idx2question = {v: k for k, v in self.question2idx.items()}  # 逆変換用の辞書(question)
 
@@ -95,18 +96,20 @@ class VQADataset(torch.utils.data.Dataset):
                     word = process_text(word)
                     if word not in self.answer2idx:
                         self.answer2idx[word] = len(self.answer2idx)
-#             # load_class_mapping
-#             url = "https://huggingface.co/spaces/CVPR/VizWiz-CLIP-VQA/raw/main/data/annotations/class_mapping.csv"
-#             response = requests.get(url)
-#             csv_data = StringIO(response.text)
-#             reader = csv.reader(csv_data)
-#             next(reader)  # Skip header
-#             for raw in reader:
-#                 word = process_text(raw[0])
-#                 if word not in self.answer2idx:
-#                         self.answer2idx[word] = len(self.answer2idx)
+            # load_class_mapping
+            url = "https://huggingface.co/spaces/CVPR/VizWiz-CLIP-VQA/raw/main/data/annotations/class_mapping.csv"
+            response = requests.get(url)
+            csv_data = StringIO(response.text)
+            reader = csv.reader(csv_data)
+            next(reader)  # Skip header
+            for raw in reader:
+                word = process_text(raw[0])
+                if word not in self.answer2idx:
+                        self.answer2idx[word] = len(self.answer2idx)
             self.idx2answer = {v: k for k, v in self.answer2idx.items()}  # 逆変換用の辞書(answer)
-            
+        
+        self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        self.bert = BertModel.from_pretrained('bert-base-uncased')
     def update_dict(self, dataset):
         """
         検証用データ，テストデータの辞書を訓練データの辞書に更新する．
@@ -141,24 +144,41 @@ class VQADataset(torch.utils.data.Dataset):
         mode_answer_idx : torch.Tensor  (1)
             10人の回答者の回答の中で最頻値の回答のid
         """
+#         image = Image.open(f"{self.image_dir}/{self.df['image'][idx]}")
+#         image = self.transform(image)
+#         question = np.zeros(len(self.idx2question) + 1)  # 未知語用の要素を追加
+#         question_words = self.df["question"][idx].split(" ")
+#         for word in question_words:
+#             try:
+#                 question[self.question2idx[word]] = 1  # one-hot表現に変換
+#             except KeyError:
+#                 question[-1] = 1  # 未知語
+
+#         if self.answer:
+#             answers = [self.answer2idx[process_text(answer["answer"])] for answer in self.df["answers"][idx]]
+#             mode_answer_idx = mode(answers)  # 最頻値を取得（正解ラベル）
+
+#             return image, torch.Tensor(question), torch.Tensor(answers), int(mode_answer_idx)
+
+#         else:
+#             return image, torch.Tensor(question)
+
         image = Image.open(f"{self.image_dir}/{self.df['image'][idx]}")
         image = self.transform(image)
-        question = np.zeros(len(self.idx2question) + 1)  # 未知語用の要素を追加
-        question_words = self.df["question"][idx].split(" ")
-        for word in question_words:
-            try:
-                question[self.question2idx[word]] = 1  # one-hot表現に変換
-            except KeyError:
-                question[-1] = 1  # 未知語
+        
+        question = self.df["question"][idx]
+        inputs = self.tokenizer(question, return_tensors="pt", padding="max_length", truncation=True, max_length=128)
+        with torch.no_grad():
+            outputs = self.bert(**inputs)
+        question_embedding = outputs.last_hidden_state.squeeze(0)
 
         if self.answer:
             answers = [self.answer2idx[process_text(answer["answer"])] for answer in self.df["answers"][idx]]
-            mode_answer_idx = mode(answers)  # 最頻値を取得（正解ラベル）
+            mode_answer_idx = mode(answers)
 
-            return image, torch.Tensor(question), torch.Tensor(answers), int(mode_answer_idx)
-
+            return image, question_embedding, torch.Tensor(answers), int(mode_answer_idx)
         else:
-            return image, torch.Tensor(question)
+            return image, question_embedding
 
     def __len__(self):
         return len(self.df)
@@ -304,17 +324,16 @@ class VQAModel(nn.Module):
     def __init__(self, vocab_size: int, n_answer: int):
         super().__init__()
         self.resnet = ResNet18()
-        self.text_encoder = nn.Linear(vocab_size, 512)
-
+        
         self.fc = nn.Sequential(
-            nn.Linear(1024, 512),
+            nn.Linear(512 + 768, 512),  # BERTの出力は768次元
             nn.ReLU(inplace=True),
             nn.Linear(512, n_answer)
         )
 
-    def forward(self, image, question):
-        image_feature = self.resnet(image)  # 画像の特徴量
-        question_feature = self.text_encoder(question)  # テキストの特徴量
+    def forward(self, image, question_embedding):
+        image_feature = self.resnet(image)
+        question_feature = question_embedding.mean(dim=1)  # 全トークンの平均を取る
 
         x = torch.cat([image_feature, question_feature], dim=1)
         x = self.fc(x)
@@ -390,7 +409,7 @@ def main():
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
     print('loading VQA model...')
-    model = VQAModel(vocab_size=len(train_dataset.question2idx)+1, n_answer=len(train_dataset.answer2idx)).to(device)
+    model = VQAModel(n_answer=len(train_dataset.answer2idx)).to(device)
 
     # optimizer / criterion
     num_epoch = 20
