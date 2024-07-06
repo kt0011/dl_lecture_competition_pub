@@ -2,6 +2,9 @@ import re
 import random
 import time
 from statistics import mode
+import csv
+from io import StringIO
+import requests
 
 from PIL import Image
 import numpy as np
@@ -92,8 +95,18 @@ class VQADataset(torch.utils.data.Dataset):
                     word = process_text(word)
                     if word not in self.answer2idx:
                         self.answer2idx[word] = len(self.answer2idx)
+#             # load_class_mapping
+#             url = "https://huggingface.co/spaces/CVPR/VizWiz-CLIP-VQA/raw/main/data/annotations/class_mapping.csv"
+#             response = requests.get(url)
+#             csv_data = StringIO(response.text)
+#             reader = csv.reader(csv_data)
+#             next(reader)  # Skip header
+#             for raw in reader:
+#                 word = process_text(raw[0])
+#                 if word not in self.answer2idx:
+#                         self.answer2idx[word] = len(self.answer2idx)
             self.idx2answer = {v: k for k, v in self.answer2idx.items()}  # 逆変換用の辞書(answer)
-
+            
     def update_dict(self, dataset):
         """
         検証用データ，テストデータの辞書を訓練データの辞書に更新する．
@@ -362,19 +375,21 @@ def main():
     # deviceの設定
     set_seed(42)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-
+    print(f'device:{device}')
     # dataloader / model
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor()
     ])
+    print('loading train data...')
     train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform)
+    print('loading test data...')
     test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, answer=False)
     test_dataset.update_dict(train_dataset)
 
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
-
+    print('loading VQA model...')
     model = VQAModel(vocab_size=len(train_dataset.question2idx)+1, n_answer=len(train_dataset.answer2idx)).to(device)
 
     # optimizer / criterion
@@ -383,6 +398,7 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
 
     # train model
+    print('training VQA model...')
     for epoch in range(num_epoch):
         train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, criterion, device)
         print(f"【{epoch + 1}/{num_epoch}】\n"
@@ -392,6 +408,7 @@ def main():
               f"train simple acc: {train_simple_acc:.4f}")
 
     # 提出用ファイルの作成
+    print('creating submission file...')
     model.eval()
     submission = []
     for image, question in test_loader:
