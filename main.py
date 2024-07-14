@@ -125,44 +125,6 @@ class VQADataset(torch.utils.data.Dataset):
         self.idx2answer = dataset.idx2answer
 
     def __getitem__(self, idx):
-        """
-        対応するidxのデータ（画像，質問，回答）を取得．
-
-        Parameters
-        ----------
-        idx : int
-            取得するデータのインデックス
-
-        Returns
-        -------
-        image : torch.Tensor  (C, H, W)
-            画像データ
-        question : torch.Tensor  (vocab_size)
-            質問文をone-hot表現に変換したもの
-        answers : torch.Tensor  (n_answer)
-            10人の回答者の回答のid
-        mode_answer_idx : torch.Tensor  (1)
-            10人の回答者の回答の中で最頻値の回答のid
-        """
-#         image = Image.open(f"{self.image_dir}/{self.df['image'][idx]}")
-#         image = self.transform(image)
-#         question = np.zeros(len(self.idx2question) + 1)  # 未知語用の要素を追加
-#         question_words = self.df["question"][idx].split(" ")
-#         for word in question_words:
-#             try:
-#                 question[self.question2idx[word]] = 1  # one-hot表現に変換
-#             except KeyError:
-#                 question[-1] = 1  # 未知語
-
-#         if self.answer:
-#             answers = [self.answer2idx[process_text(answer["answer"])] for answer in self.df["answers"][idx]]
-#             mode_answer_idx = mode(answers)  # 最頻値を取得（正解ラベル）
-
-#             return image, torch.Tensor(question), torch.Tensor(answers), int(mode_answer_idx)
-
-#         else:
-#             return image, torch.Tensor(question)
-
         image = Image.open(f"{self.image_dir}/{self.df['image'][idx]}")
         image = self.transform(image)
         
@@ -179,7 +141,7 @@ class VQADataset(torch.utils.data.Dataset):
             return image, question_embedding, torch.Tensor(answers), int(mode_answer_idx)
         else:
             return image, question_embedding
-
+        
     def __len__(self):
         return len(self.df)
 
@@ -321,7 +283,7 @@ def ResNet50():
 
 
 class VQAModel(nn.Module):
-    def __init__(self, vocab_size: int, n_answer: int):
+    def __init__(self, n_answer: int):
         super().__init__()
         self.resnet = ResNet18()
         
@@ -350,12 +312,12 @@ def train(model, dataloader, optimizer, criterion, device):
     simple_acc = 0
 
     start = time.time()
-    for image, question, answers, mode_answer in dataloader:
-        image, question, answer, mode_answer = \
-            image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
+    for image, question_embedding, answers, mode_answer in dataloader:
+        image, question_embedding, answers, mode_answer = \
+            image.to(device), question_embedding.to(device), answers.to(device), mode_answer.to(device)
 
-        pred = model(image, question)
-        loss = criterion(pred, mode_answer.squeeze())
+        pred = model(image, question_embedding)
+        loss = criterion(pred, mode_answer)
 
         optimizer.zero_grad()
         loss.backward()
@@ -368,7 +330,7 @@ def train(model, dataloader, optimizer, criterion, device):
     return total_loss / len(dataloader), total_acc / len(dataloader), simple_acc / len(dataloader), time.time() - start
 
 
-def eval(model, dataloader, optimizer, criterion, device):
+def eval(model, dataloader, criterion, device):
     model.eval()
 
     total_loss = 0
@@ -376,16 +338,17 @@ def eval(model, dataloader, optimizer, criterion, device):
     simple_acc = 0
 
     start = time.time()
-    for image, question, answers, mode_answer in dataloader:
-        image, question, answer, mode_answer = \
-            image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
+    with torch.no_grad():
+        for image, question_embedding, answers, mode_answer in dataloader:
+            image, question_embedding, answers, mode_answer = \
+                image.to(device), question_embedding.to(device), answers.to(device), mode_answer.to(device)
 
-        pred = model(image, question)
-        loss = criterion(pred, mode_answer.squeeze())
+            pred = model(image, question_embedding)
+            loss = criterion(pred, mode_answer)
 
-        total_loss += loss.item()
-        total_acc += VQA_criterion(pred.argmax(1), answers)  # VQA accuracy
-        simple_acc += (pred.argmax(1) == mode_answer).mean().item()  # simple accuracy
+            total_loss += loss.item()
+            total_acc += VQA_criterion(pred.argmax(1), answers)  # VQA accuracy
+            simple_acc += (pred.argmax(1) == mode_answer).float().mean().item()  # simple accuracy
 
     return total_loss / len(dataloader), total_acc / len(dataloader), simple_acc / len(dataloader), time.time() - start
 
@@ -410,7 +373,6 @@ def main():
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
     print('loading VQA model...')
     model = VQAModel(n_answer=len(train_dataset.answer2idx)).to(device)
-
     # optimizer / criterion
     num_epoch = 20
     criterion = nn.CrossEntropyLoss()
@@ -430,11 +392,12 @@ def main():
     print('creating submission file...')
     model.eval()
     submission = []
-    for image, question in test_loader:
-        image, question = image.to(device), question.to(device)
-        pred = model(image, question)
-        pred = pred.argmax(1).cpu().item()
-        submission.append(pred)
+    with torch.no_grad():
+        for image, question_embedding in test_loader:
+            image, question_embedding = image.to(device), question_embedding.to(device)
+            pred = model(image, question_embedding)
+            pred = pred.argmax(1).cpu().item()
+            submission.append(pred)
 
     submission = [train_dataset.idx2answer[id] for id in submission]
     submission = np.array(submission)
